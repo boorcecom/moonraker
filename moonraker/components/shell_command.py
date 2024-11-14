@@ -22,6 +22,7 @@ from typing import (
     Coroutine,
     Dict,
     Set,
+    cast
 )
 if TYPE_CHECKING:
     from ..confighelper import ConfigHelper
@@ -46,7 +47,6 @@ class ShellCommandProtocol(asyncio.subprocess.SubprocessStreamProtocol):
         self,
         limit: int,
         loop: asyncio.events.AbstractEventLoop,
-        program_name: str = "",
         std_out_cb: OutputCallback = None,
         std_err_cb: OutputCallback = None,
         log_stderr: bool = False
@@ -54,7 +54,6 @@ class ShellCommandProtocol(asyncio.subprocess.SubprocessStreamProtocol):
         self._loop = loop
         self._pipe_fds: List[int] = []
         super().__init__(limit, loop)
-        self.program_name = program_name
         self.std_out_cb = std_out_cb
         self.std_err_cb = std_err_cb
         self.log_stderr = log_stderr
@@ -63,8 +62,8 @@ class ShellCommandProtocol(asyncio.subprocess.SubprocessStreamProtocol):
     def connection_made(
         self, transport: asyncio.transports.BaseTransport
     ) -> None:
+        transport = cast(asyncio.SubprocessTransport, transport)
         self._transport = transport
-        assert isinstance(transport, asyncio.SubprocessTransport)
         stdout_transport = transport.get_pipe_transport(1)
         if stdout_transport is not None:
             self._pipe_fds.append(1)
@@ -94,7 +93,7 @@ class ShellCommandProtocol(asyncio.subprocess.SubprocessStreamProtocol):
                     msg = data.decode(errors='ignore')
                 else:
                     msg = data
-                logging.info(f"{self.program_name}: {msg}")
+                logging.info(msg)
         if cb is not None:
             if isinstance(data, str):
                 data = data.encode()
@@ -229,7 +228,7 @@ class ShellCommand:
     async def run_with_response(
         self,
         timeout: float = 2.,
-        retries: int = 1,
+        attempts: int = 1,
         log_complete: bool = True,
         sig_idx: int = 1,
         proc_input: Optional[str] = None,
@@ -237,11 +236,11 @@ class ShellCommand:
     ) -> str:
         async with self.run_lock:
             self.factory.add_running_command(self)
-            retries = max(1, retries)
+            attempts = max(1, attempts)
             stdin: Optional[bytes] = None
             if proc_input is not None:
                 stdin = proc_input.encode()
-            while retries > 0:
+            while attempts > 0:
                 self._reset_command_data()
                 timed_out = False
                 stdout = stderr = b""
@@ -272,7 +271,7 @@ class ShellCommand:
                             f"\n{stdout.decode(errors='ignore')}")
                     if self.cancelled and not timed_out:
                         break
-                retries -= 1
+                attempts -= 1
                 await asyncio.sleep(.5)
             self.factory.remove_running_command(self)
             raise ShellCommandError(
@@ -288,9 +287,9 @@ class ShellCommand:
 
         def protocol_factory():
             return ShellCommandProtocol(
-                limit=2**20, loop=loop, program_name=self.command[0],
-                std_out_cb=self.std_out_cb, std_err_cb=self.std_err_cb,
-                log_stderr=self.log_stderr)
+                limit=2**20, loop=loop, std_out_cb=self.std_out_cb,
+                std_err_cb=self.std_err_cb, log_stderr=self.log_stderr
+            )
         try:
             stdpipe: Optional[int] = None
             if has_input:
@@ -311,6 +310,8 @@ class ShellCommand:
                     *self.command, stdin=stdpipe,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=errpipe, env=self.env, cwd=self.cwd)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logging.exception(
                 f"shell_command: Command ({self.name}) failed")
@@ -368,11 +369,14 @@ class ShellCommandFactory:
             self, cmd, callback, std_err_callback, env, log_stderr, cwd
         )
 
-    def exec_cmd(
+    def run_cmd_async(
         self,
         cmd: str,
+        callback: OutputCallback = None,
+        std_err_callback: OutputCallback = None,
         timeout: float = 2.,
-        retries: int = 1,
+        attempts: int = 1,
+        verbose: bool = True,
         sig_idx: int = 1,
         proc_input: Optional[str] = None,
         log_complete: bool = True,
@@ -380,11 +384,47 @@ class ShellCommandFactory:
         env: Optional[Dict[str, str]] = None,
         cwd: Optional[str] = None,
         success_codes: Optional[List[int]] = None
-    ) -> Awaitable:
+    ) -> Awaitable[None]:
+        """
+        Runs a command and processes responses as they are received. Optional
+        callbacks may be provided to handle stdout and stderr.
+        """
+        scmd = ShellCommand(
+            self, cmd, callback, std_err_callback, env, log_stderr, cwd
+        )
+        attempts = max(1, attempts)
+        async def _wrapper() -> None:
+            for _ in range(attempts):
+                if await scmd.run(
+                    timeout, verbose, log_complete, sig_idx,
+                    proc_input, success_codes
+                ):
+                    break
+            else:
+                ret_code = scmd.get_return_code()
+                raise ShellCommandError(f"Error running command {cmd}", ret_code)
+        return asyncio.create_task(_wrapper())
+
+    def exec_cmd(
+        self,
+        cmd: str,
+        timeout: float = 2.,
+        attempts: int = 1,
+        sig_idx: int = 1,
+        proc_input: Optional[str] = None,
+        log_complete: bool = True,
+        log_stderr: bool = False,
+        env: Optional[Dict[str, str]] = None,
+        cwd: Optional[str] = None,
+        success_codes: Optional[List[int]] = None
+    ) -> Awaitable[str]:
+        """
+        Executes a command and returns UTF-8 decoded stdout upon completion.
+        """
         scmd = ShellCommand(self, cmd, None, None, env,
                             log_stderr, cwd)
         coro = scmd.run_with_response(
-            timeout, retries, log_complete, sig_idx,
+            timeout, attempts, log_complete, sig_idx,
             proc_input, success_codes
         )
         return asyncio.create_task(coro)

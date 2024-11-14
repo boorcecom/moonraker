@@ -6,14 +6,15 @@
 
 from __future__ import annotations
 import re
-import json
 import time
 import asyncio
 import pathlib
 import tempfile
 import logging
+import copy
 from ..utils import ServerError
-from tornado.escape import url_escape, url_unescape
+from ..utils import json_wrapper as jsonw
+from tornado.escape import url_unescape
 from tornado.httpclient import AsyncHTTPClient, HTTPRequest, HTTPError
 from tornado.httputil import HTTPHeaders
 from typing import (
@@ -71,7 +72,7 @@ class HttpClient:
         self,
         method: str,
         url: str,
-        body: Optional[Union[str, List[Any], Dict[str, Any]]] = None,
+        body: Optional[Union[bytes, str, List[Any], Dict[str, Any]]] = None,
         headers: Optional[Dict[str, Any]] = None,
         connect_timeout: float = 5.,
         request_timeout: float = 10.,
@@ -79,14 +80,16 @@ class HttpClient:
         retry_pause_time: float = .1,
         enable_cache: bool = False,
         send_etag: bool = True,
-        send_if_modified_since: bool = True
+        send_if_modified_since: bool = True,
+        basic_auth_user: Optional[str] = None,
+        basic_auth_pass: Optional[str] = None
     ) -> HttpResponse:
         cache_key = url.split("?", 1)[0]
         method = method.upper()
         # prepare the body if required
         req_headers: Dict[str, Any] = {}
         if isinstance(body, (list, dict)):
-            body = json.dumps(body)
+            body = jsonw.dumps(body)
             req_headers["Content-Type"] = "application/json"
         cached: Optional[HttpResponse] = None
         if enable_cache:
@@ -102,9 +105,17 @@ class HttpClient:
             headers = req_headers
 
         timeout = 1 + connect_timeout + request_timeout
-        request = HTTPRequest(url, method, headers, body=body,
-                              request_timeout=request_timeout,
-                              connect_timeout=connect_timeout)
+        req_args: Dict[str, Any] = dict(
+            body=body,
+            request_timeout=request_timeout,
+            connect_timeout=connect_timeout
+        )
+        if basic_auth_user is not None:
+            assert basic_auth_pass is not None
+            req_args["auth_username"] = basic_auth_user
+            req_args["auth_password"] = basic_auth_pass
+            req_args["auth_mode"] = "basic"
+        request = HTTPRequest(url, method, headers, **req_args)
         err: Optional[BaseException] = None
         for i in range(attempts):
             if i:
@@ -267,8 +278,58 @@ class HttpClient:
                 return dl.dest_file
         raise self.server.error(f"Retries exceeded for request: {url}")
 
+    def wrap_request(self, default_url: str, **kwargs) -> HttpRequestWrapper:
+        return HttpRequestWrapper(self, default_url, **kwargs)
+
     def close(self):
         self.client.close()
+
+class HttpRequestWrapper:
+    def __init__(
+        self, client: HttpClient, default_url: str, **kwargs
+    ) -> None:
+        self._do_request = client.request
+        self._last_response: Optional[HttpResponse] = None
+        self.default_request_args: Dict[str, Any] = {
+            "method": "GET",
+            "url": default_url,
+        }
+        self.default_request_args.update(kwargs)
+        self.request_args = copy.deepcopy(self.default_request_args)
+        self.reset()
+
+    async def send(self, **kwargs) -> HttpResponse:
+        req_args = copy.deepcopy(self.request_args)
+        req_args.update(kwargs)
+        method = req_args.pop("method", self.default_request_args["method"])
+        url = req_args.pop("url", self.default_request_args["url"])
+        self._last_response = await self._do_request(method, url, **req_args)
+        return self._last_response
+
+    def set_method(self, method: str) -> None:
+        self.request_args["method"] = method
+
+    def set_url(self, url: str) -> None:
+        self.request_args["url"] = url
+
+    def set_body(
+        self, body: Optional[Union[str, List[Any], Dict[str, Any]]]
+    ) -> None:
+        self.request_args["body"] = body
+
+    def add_header(self, name: str, value: str) -> None:
+        headers = self.request_args.get("headers", {})
+        headers[name] = value
+        self.request_args["headers"] = headers
+
+    def set_headers(self, headers: Dict[str, str]) -> None:
+        self.request_args["headers"] = headers
+
+    def reset(self) -> None:
+        self.request_args = copy.deepcopy(self.default_request_args)
+
+    def last_response(self) -> Optional[HttpResponse]:
+        return self._last_response
 
 class HttpResponse:
     def __init__(self,
@@ -290,8 +351,8 @@ class HttpResponse:
         self._last_modified: Optional[str] = response_headers.get(
             "last-modified", None)
 
-    def json(self, **kwargs) -> Union[List[Any], Dict[str, Any]]:
-        return json.loads(self._result, **kwargs)
+    def json(self) -> Union[List[Any], Dict[str, Any]]:
+        return jsonw.loads(self._result)
 
     def is_cachable(self) -> bool:
         return self._last_modified is not None or self._etag is not None
